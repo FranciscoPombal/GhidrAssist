@@ -51,9 +51,21 @@ public class GeminiOAuthProvider extends APIProvider implements FunctionCallingP
     // Default model
     private static final String DEFAULT_MODEL = "gemini-2.5-flash";
 
+    // Synthetic thought signature used when the original is unavailable.
+    // Matches the Gemini CLI's skip_thought_signature_validator behavior.
+    private static final String SYNTHETIC_THOUGHT_SIGNATURE = "skip_thought_signature_validator";
+
+    // Rate limiting: minimum interval between API requests (milliseconds)
+    private static final long MIN_REQUEST_INTERVAL_MS = 2000;
+    // Maximum backoff for 429 retries (milliseconds)
+    private static final long MAX_RATE_LIMIT_BACKOFF_MS = 60_000;
+    // Initial backoff for 429 retries (milliseconds)
+    private static final long INITIAL_RATE_LIMIT_BACKOFF_MS = 5_000;
+
     private final GeminiOAuthTokenManager tokenManager;
     private final String sessionId;
     private volatile boolean isCancelled = false;
+    private volatile long lastRequestTimeMs = 0;
 
     public GeminiOAuthProvider(String name, String model, Integer maxTokens, String url,
                                String key, boolean disableTlsVerification, Integer timeout) {
@@ -143,6 +155,215 @@ public class GeminiOAuthProvider extends APIProvider implements FunctionCallingP
     }
 
     // =========================================================================
+    // Rate Limiting
+    // =========================================================================
+
+    /**
+     * Enforces minimum interval between API requests.
+     * Blocks until at least MIN_REQUEST_INTERVAL_MS has elapsed since the last request.
+     */
+    private synchronized void enforceRateLimit() {
+        long now = System.currentTimeMillis();
+        long elapsed = now - lastRequestTimeMs;
+        if (elapsed < MIN_REQUEST_INTERVAL_MS && lastRequestTimeMs > 0) {
+            long sleepMs = MIN_REQUEST_INTERVAL_MS - elapsed;
+            Msg.debug(this, "Rate limiting: waiting " + sleepMs + "ms before next request");
+            try {
+                Thread.sleep(sleepMs);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        lastRequestTimeMs = System.currentTimeMillis();
+    }
+
+    /**
+     * Executes an HTTP request with automatic retry on 429 rate limit responses.
+     * Retries indefinitely with backoff capped at MAX_RATE_LIMIT_BACKOFF_MS.
+     * Returns the successful Response (caller is responsible for closing it).
+     */
+    private Response executeWithRateLimitRetry(Request request, String operation) throws IOException, APIProviderException {
+        long backoffMs = INITIAL_RATE_LIMIT_BACKOFF_MS;
+        int attempt = 0;
+
+        while (true) {
+            if (isCancelled) {
+                throw new APIProviderException(APIProviderException.ErrorCategory.CANCELLED,
+                    name, operation, "Request cancelled");
+            }
+
+            enforceRateLimit();
+            Response response = client.newCall(request).execute();
+
+            if (response.code() != 429) {
+                return response;
+            }
+
+            // 429 - rate limited. Close this response and retry.
+            response.close();
+            attempt++;
+
+            // Check for Retry-After header
+            String retryAfter = response.header("Retry-After");
+            long waitMs = backoffMs;
+            if (retryAfter != null) {
+                try {
+                    waitMs = Long.parseLong(retryAfter) * 1000;
+                } catch (NumberFormatException e) {
+                    // ignore, use computed backoff
+                }
+            }
+            waitMs = Math.min(waitMs, MAX_RATE_LIMIT_BACKOFF_MS);
+
+            Msg.info(this, String.format("Rate limited (429) on %s, attempt %d. Waiting %dms...",
+                operation, attempt, waitMs));
+
+            try {
+                Thread.sleep(waitMs);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrupted during rate limit backoff", e);
+            }
+
+            // Increase backoff for next time, capped
+            backoffMs = Math.min(backoffMs * 2, MAX_RATE_LIMIT_BACKOFF_MS);
+        }
+    }
+
+    /**
+     * Enqueues a streaming HTTP request with automatic retry on 429 rate limit responses.
+     * Retries indefinitely with backoff capped at MAX_RATE_LIMIT_BACKOFF_MS.
+     */
+    private void enqueueStreamingWithRetry(Request request, LlmResponseHandler handler) {
+        enforceRateLimit();
+        client.newCall(request).enqueue(new Callback() {
+            private boolean isFirst = true;
+            private StringBuilder contentBuilder = new StringBuilder();
+            private long backoffMs = INITIAL_RATE_LIMIT_BACKOFF_MS;
+            private int rateLimitAttempt = 0;
+
+            @Override
+            public void onFailure(Call call, IOException e) {
+                handler.onError(handleNetworkError(e, "streamChatCompletion"));
+            }
+
+            @Override
+            public void onResponse(Call call, Response response) throws IOException {
+                try (ResponseBody responseBody = response.body()) {
+                    if (response.code() == 401) {
+                        handler.onError(new AuthenticationException(name, "streamChatCompletion",
+                            401, null, "Authentication failed. Please re-authenticate."));
+                        return;
+                    }
+                    if (response.code() == 429) {
+                        // Rate limited - retry with backoff, never give up
+                        rateLimitAttempt++;
+                        String retryAfter = response.header("Retry-After");
+                        long waitMs = backoffMs;
+                        if (retryAfter != null) {
+                            try {
+                                waitMs = Long.parseLong(retryAfter) * 1000;
+                            } catch (NumberFormatException e) {
+                                // ignore, use computed backoff
+                            }
+                        }
+                        waitMs = Math.min(waitMs, MAX_RATE_LIMIT_BACKOFF_MS);
+
+                        Msg.info(GeminiOAuthProvider.this, String.format(
+                            "Rate limited (429) on streaming, attempt %d. Waiting %dms...",
+                            rateLimitAttempt, waitMs));
+
+                        try {
+                            Thread.sleep(waitMs);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            handler.onError(handleNetworkError(
+                                new IOException("Interrupted during rate limit backoff", e),
+                                "streamChatCompletion"));
+                            return;
+                        }
+
+                        backoffMs = Math.min(backoffMs * 2, MAX_RATE_LIMIT_BACKOFF_MS);
+
+                        // Re-enqueue the request
+                        if (!isCancelled) {
+                            enforceRateLimit();
+                            client.newCall(request).enqueue(this);
+                        }
+                        return;
+                    }
+                    if (!response.isSuccessful()) {
+                        String errorBody = responseBody != null ? responseBody.string() : "";
+                        handler.onError(new APIProviderException(APIProviderException.ErrorCategory.SERVICE_ERROR,
+                            name, "streamChatCompletion",
+                            "API error " + response.code() + ": " + errorBody));
+                        return;
+                    }
+
+                    // Parse SSE: multi-line data blocks separated by empty lines
+                    BufferedSource source = responseBody.source();
+                    List<String> bufferedLines = new ArrayList<>();
+
+                    while (!source.exhausted() && !isCancelled && handler.shouldContinue()) {
+                        String line = source.readUtf8Line();
+                        if (line == null) break;
+
+                        if (line.startsWith("data: ")) {
+                            bufferedLines.add(line.substring(6).trim());
+                        } else if (line.isEmpty() && !bufferedLines.isEmpty()) {
+                            // Empty line = end of SSE block, parse buffered data
+                            try {
+                                String jsonStr = String.join("\n", bufferedLines);
+                                JsonObject event = gson.fromJson(jsonStr, JsonObject.class);
+                                JsonObject unwrapped = unwrapResponse(event);
+
+                                // Extract text from candidates
+                                JsonArray candidates = unwrapped.has("candidates")
+                                    ? unwrapped.getAsJsonArray("candidates") : null;
+
+                                if (candidates != null && candidates.size() > 0) {
+                                    JsonObject firstCandidate = candidates.get(0).getAsJsonObject();
+                                    if (firstCandidate.has("content") && firstCandidate.get("content").isJsonObject()) {
+                                        JsonArray parts = firstCandidate.getAsJsonObject("content")
+                                            .has("parts") ? firstCandidate.getAsJsonObject("content").getAsJsonArray("parts") : null;
+
+                                        if (parts != null) {
+                                            for (JsonElement partEl : parts) {
+                                                JsonObject part = partEl.getAsJsonObject();
+                                                if (part.has("text")) {
+                                                    String text = part.get("text").getAsString();
+                                                    if (!text.isEmpty()) {
+                                                        if (isFirst) {
+                                                            handler.onStart();
+                                                            isFirst = false;
+                                                        }
+                                                        contentBuilder.append(text);
+                                                        handler.onUpdate(text);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } catch (Exception e) {
+                                Msg.debug(GeminiOAuthProvider.this, "Skipping malformed SSE event: " + e.getMessage());
+                            }
+                            bufferedLines.clear();
+                        }
+                    }
+
+                    if (isCancelled) {
+                        handler.onError(new APIProviderException(APIProviderException.ErrorCategory.CANCELLED,
+                            name, "streamChatCompletion", "Request cancelled"));
+                    } else {
+                        handler.onComplete(contentBuilder.toString());
+                    }
+                }
+            }
+        });
+    }
+
+    // =========================================================================
     // Message Translation - Gemini Native Format
     // =========================================================================
 
@@ -159,7 +380,8 @@ public class GeminiOAuthProvider extends APIProvider implements FunctionCallingP
             return result;
         }
 
-        for (ChatMessage message : messages) {
+        for (int i = 0; i < messages.size(); i++) {
+            ChatMessage message = messages.get(i);
             if (message == null || message.getRole() == null) continue;
 
             String role = message.getRole();
@@ -240,6 +462,9 @@ public class GeminiOAuthProvider extends APIProvider implements FunctionCallingP
                         functionCall.add("args", args);
 
                         JsonObject fcPart = new JsonObject();
+                        // Gemini API requires thoughtSignature on function call parts.
+                        // Use synthetic signature when original is unavailable.
+                        fcPart.addProperty("thoughtSignature", SYNTHETIC_THOUGHT_SIGNATURE);
                         fcPart.add("functionCall", functionCall);
                         parts.add(fcPart);
                     }
@@ -267,14 +492,31 @@ public class GeminiOAuthProvider extends APIProvider implements FunctionCallingP
             }
 
             if (ChatMessage.ChatMessageRole.TOOL.equals(role) || ChatMessage.ChatMessageRole.FUNCTION.equals(role)) {
-                if (content != null && !content.isEmpty()) {
-                    JsonObject entry = new JsonObject();
-                    entry.addProperty("role", "user");
-                    JsonArray parts = new JsonArray();
+                // Batch all consecutive TOOL messages into a single user content block.
+                // Gemini requires the number of functionResponse parts to match the
+                // number of functionCall parts from the preceding model turn.
+                JsonObject entry = new JsonObject();
+                entry.addProperty("role", "user");
+                JsonArray parts = new JsonArray();
 
+                // Process this TOOL message and all consecutive ones
+                for (; i < messages.size(); i++) {
+                    ChatMessage toolMsg = messages.get(i);
+                    if (toolMsg == null || toolMsg.getRole() == null) continue;
+                    String toolRole = toolMsg.getRole();
+                    if (!ChatMessage.ChatMessageRole.TOOL.equals(toolRole) &&
+                        !ChatMessage.ChatMessageRole.FUNCTION.equals(toolRole)) {
+                        // Not a TOOL message - back up so outer loop processes it
+                        i--;
+                        break;
+                    }
+
+                    // Always create a functionResponse part for every TOOL message.
+                    // Gemini requires exactly one functionResponse for each functionCall.
+                    // Skipping empty results would cause a count mismatch error.
+                    String toolContent = toolMsg.getContent();
                     JsonObject funcResponse = new JsonObject();
-                    String toolCallId = message.getToolCallId();
-                    // Look up the actual function name from prior assistant messages' tool_calls
+                    String toolCallId = toolMsg.getToolCallId();
                     String funcName = lookupFunctionName(messages, toolCallId);
                     funcResponse.addProperty("name", funcName);
                     if (toolCallId != null) {
@@ -282,13 +524,16 @@ public class GeminiOAuthProvider extends APIProvider implements FunctionCallingP
                     }
 
                     JsonObject responseContent = new JsonObject();
-                    responseContent.addProperty("output", content);
+                    responseContent.addProperty("output",
+                        (toolContent != null && !toolContent.isEmpty()) ? toolContent : "(no output)");
                     funcResponse.add("response", responseContent);
 
                     JsonObject frPart = new JsonObject();
                     frPart.add("functionResponse", funcResponse);
                     parts.add(frPart);
+                }
 
+                if (parts.size() > 0) {
                     entry.add("parts", parts);
                     contents.add(entry);
                 }
@@ -492,14 +737,11 @@ public class GeminiOAuthProvider extends APIProvider implements FunctionCallingP
                 .headers(headers)
                 .build();
 
-            try (Response response = client.newCall(request).execute()) {
+            try (Response response = executeWithRateLimitRetry(request, "createChatCompletion")) {
                 if (response.code() == 401) {
                     throw new AuthenticationException(name, "createChatCompletion", 401,
                         response.body() != null ? response.body().string() : null,
                         "Authentication failed. Please re-authenticate.");
-                }
-                if (response.code() == 429) {
-                    throw new RateLimitException(name, "createChatCompletion", null, null);
                 }
                 if (!response.isSuccessful()) {
                     String errorBody = response.body() != null ? response.body().string() : "";
@@ -544,96 +786,7 @@ public class GeminiOAuthProvider extends APIProvider implements FunctionCallingP
                 .headers(headers)
                 .build();
 
-            client.newCall(request).enqueue(new Callback() {
-                private boolean isFirst = true;
-                private StringBuilder contentBuilder = new StringBuilder();
-
-                @Override
-                public void onFailure(Call call, IOException e) {
-                    handler.onError(handleNetworkError(e, "streamChatCompletion"));
-                }
-
-                @Override
-                public void onResponse(Call call, Response response) throws IOException {
-                    try (ResponseBody responseBody = response.body()) {
-                        if (response.code() == 401) {
-                            handler.onError(new AuthenticationException(name, "streamChatCompletion",
-                                401, null, "Authentication failed. Please re-authenticate."));
-                            return;
-                        }
-                        if (response.code() == 429) {
-                            handler.onError(new RateLimitException(name, "streamChatCompletion", null, null));
-                            return;
-                        }
-                        if (!response.isSuccessful()) {
-                            String errorBody = responseBody != null ? responseBody.string() : "";
-                            handler.onError(new APIProviderException(APIProviderException.ErrorCategory.SERVICE_ERROR,
-                                name, "streamChatCompletion",
-                                "API error " + response.code() + ": " + errorBody));
-                            return;
-                        }
-
-                        // Parse SSE: multi-line data blocks separated by empty lines
-                        BufferedSource source = responseBody.source();
-                        List<String> bufferedLines = new ArrayList<>();
-
-                        while (!source.exhausted() && !isCancelled && handler.shouldContinue()) {
-                            String line = source.readUtf8Line();
-                            if (line == null) break;
-
-                            if (line.startsWith("data: ")) {
-                                bufferedLines.add(line.substring(6).trim());
-                            } else if (line.isEmpty() && !bufferedLines.isEmpty()) {
-                                // Empty line = end of SSE block, parse buffered data
-                                try {
-                                    String jsonStr = String.join("\n", bufferedLines);
-                                    JsonObject event = gson.fromJson(jsonStr, JsonObject.class);
-                                    JsonObject unwrapped = unwrapResponse(event);
-
-                                    // Extract text from candidates
-                                    JsonArray candidates = unwrapped.has("candidates")
-                                        ? unwrapped.getAsJsonArray("candidates") : null;
-
-                                    if (candidates != null && candidates.size() > 0) {
-                                        JsonObject firstCandidate = candidates.get(0).getAsJsonObject();
-                                        if (firstCandidate.has("content") && firstCandidate.get("content").isJsonObject()) {
-                                            JsonArray parts = firstCandidate.getAsJsonObject("content")
-                                                .has("parts") ? firstCandidate.getAsJsonObject("content").getAsJsonArray("parts") : null;
-
-                                            if (parts != null) {
-                                                for (JsonElement partEl : parts) {
-                                                    JsonObject part = partEl.getAsJsonObject();
-                                                    if (part.has("text")) {
-                                                        String text = part.get("text").getAsString();
-                                                        if (!text.isEmpty()) {
-                                                            if (isFirst) {
-                                                                handler.onStart();
-                                                                isFirst = false;
-                                                            }
-                                                            contentBuilder.append(text);
-                                                            handler.onUpdate(text);
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                } catch (Exception e) {
-                                    Msg.debug(GeminiOAuthProvider.this, "Skipping malformed SSE event: " + e.getMessage());
-                                }
-                                bufferedLines.clear();
-                            }
-                        }
-
-                        if (isCancelled) {
-                            handler.onError(new APIProviderException(APIProviderException.ErrorCategory.CANCELLED,
-                                name, "streamChatCompletion", "Request cancelled"));
-                        } else {
-                            handler.onComplete(contentBuilder.toString());
-                        }
-                    }
-                }
-            });
+            enqueueStreamingWithRetry(request, handler);
         } catch (IOException e) {
             handler.onError(handleNetworkError(e, "streamChatCompletion"));
         }
@@ -665,7 +818,7 @@ public class GeminiOAuthProvider extends APIProvider implements FunctionCallingP
                 .headers(headers)
                 .build();
 
-            try (Response response = client.newCall(request).execute()) {
+            try (Response response = executeWithRateLimitRetry(request, "createChatCompletionWithFunctions")) {
                 if (response.code() == 401) {
                     throw new AuthenticationException(name, "createChatCompletionWithFunctions", 401,
                         response.body() != null ? response.body().string() : null,
@@ -735,7 +888,7 @@ public class GeminiOAuthProvider extends APIProvider implements FunctionCallingP
                 .headers(headers)
                 .build();
 
-            try (Response response = client.newCall(request).execute()) {
+            try (Response response = executeWithRateLimitRetry(request, "createChatCompletionWithFunctionsFullResponse")) {
                 if (response.code() == 401) {
                     throw new AuthenticationException(name, "createChatCompletionWithFunctionsFullResponse", 401,
                         response.body() != null ? response.body().string() : null,

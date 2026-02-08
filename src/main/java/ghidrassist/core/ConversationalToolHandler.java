@@ -40,10 +40,10 @@ public class ConversationalToolHandler {
     private volatile boolean isCancelled = false;
     private int rateLimitRetries = 0;
     private int toolCallRound = 0; // Track tool calling rounds within iteration
-    private static final int MAX_RATE_LIMIT_RETRIES = 3;
+    private static final int MAX_RATE_LIMIT_BACKOFF_SECONDS = 60;
     private static final int MAX_CONVERSATION_HISTORY = 20; // Keep last 20 messages to prevent token overflow
     private final int maxToolRounds; // Maximum tool calling rounds per iteration (configurable)
-    private static final int API_TIMEOUT_SECONDS = 120; // Timeout for blocking API calls
+    private static final int API_TIMEOUT_SECONDS = 300; // Timeout for blocking API calls (generous for rate limit retries)
 
     public ConversationalToolHandler(
             LlmApiClient apiClient,
@@ -258,38 +258,28 @@ public class ConversationalToolHandler {
                             return null;
                         }
 
-                        // Handle rate limit errors with additional backoff and retry
+                        // Handle rate limit errors - always retry, never give up
                         String errorMsg = cause.getMessage() != null ? cause.getMessage() : "";
                         if (cause instanceof ghidrassist.apiprovider.exceptions.RateLimitException ||
                             errorMsg.contains("rate limit") ||
                             errorMsg.contains("429")) {
 
                             rateLimitRetries++;
+                            Msg.warn(this, String.format("Rate limit exceeded during conversational tool calling (attempt %d). Retrying with backoff...",
+                                rateLimitRetries));
 
-                            if (rateLimitRetries <= MAX_RATE_LIMIT_RETRIES) {
-                                Msg.warn(this, String.format("Rate limit exceeded during conversational tool calling (attempt %d/%d). Implementing additional backoff...",
-                                    rateLimitRetries, MAX_RATE_LIMIT_RETRIES));
+                            // Backoff: 10s, 20s, 30s, ... capped at MAX_RATE_LIMIT_BACKOFF_SECONDS
+                            int backoffSeconds = Math.min(10 * rateLimitRetries, MAX_RATE_LIMIT_BACKOFF_SECONDS);
+                            userHandler.onUpdate(String.format("⏳ Rate limit hit. Pausing for %d seconds...\n",
+                                backoffSeconds));
 
-                                int backoffSeconds = 30 * rateLimitRetries;
-                                userHandler.onUpdate(String.format("⏳ Rate limit exceeded. Pausing for %d seconds...\n",
-                                    backoffSeconds));
-
-                                CompletableFuture.delayedExecutor(backoffSeconds, java.util.concurrent.TimeUnit.SECONDS)
-                                    .execute(() -> {
-                                        if (isConversationActive && !isCancelled) {
-                                            userHandler.onUpdate("🔄 Resuming...\n");
-                                            continueConversation();
-                                        }
-                                    });
-                            } else {
-                                isConversationActive = false;
-                                userHandler.onUpdate("❌ Too many rate limit errors. Please try again later.\n");
-                                userHandler.onError(new Exception("Rate limit exceeded maximum retry attempts. Please try again later or reduce query complexity."));
-
-                                if (onCompletionCallback != null) {
-                                    onCompletionCallback.run();
-                                }
-                            }
+                            CompletableFuture.delayedExecutor(backoffSeconds, java.util.concurrent.TimeUnit.SECONDS)
+                                .execute(() -> {
+                                    if (isConversationActive && !isCancelled) {
+                                        userHandler.onUpdate("🔄 Resuming...\n");
+                                        continueConversation();
+                                    }
+                                });
                         } else {
                             // Non-rate-limit errors stop the conversation
                             isConversationActive = false;
@@ -411,38 +401,27 @@ public class ConversationalToolHandler {
 
                     @Override
                     public void onError(Throwable error) {
-                        // Handle rate limit errors with retry logic
+                        // Handle rate limit errors - always retry, never give up
                         if (error instanceof RateLimitException ||
                             error.getMessage().contains("rate limit") ||
                             error.getMessage().contains("429")) {
 
                             rateLimitRetries++;
+                            Msg.warn(ConversationalToolHandler.this,
+                                String.format("Rate limit exceeded during streaming (attempt %d). Retrying with backoff...",
+                                    rateLimitRetries));
 
-                            if (rateLimitRetries <= MAX_RATE_LIMIT_RETRIES) {
-                                Msg.warn(ConversationalToolHandler.this,
-                                    String.format("Rate limit exceeded during streaming (attempt %d/%d).",
-                                        rateLimitRetries, MAX_RATE_LIMIT_RETRIES));
+                            int backoffSeconds = Math.min(10 * rateLimitRetries, MAX_RATE_LIMIT_BACKOFF_SECONDS);
+                            userHandler.onUpdate(String.format("⏳ Rate limit hit. Pausing for %d seconds...\n",
+                                backoffSeconds));
 
-                                int backoffSeconds = 30 * rateLimitRetries;
-                                userHandler.onUpdate(String.format("⏳ Rate limit exceeded. Pausing for %d seconds...\n",
-                                    backoffSeconds));
-
-                                CompletableFuture.delayedExecutor(backoffSeconds, java.util.concurrent.TimeUnit.SECONDS)
-                                    .execute(() -> {
-                                        if (isConversationActive && !isCancelled) {
-                                            userHandler.onUpdate("🔄 Resuming...\n");
-                                            continueConversation();
-                                        }
-                                    });
-                            } else {
-                                isConversationActive = false;
-                                userHandler.onUpdate("❌ Too many rate limit errors. Please try again later.\n");
-                                userHandler.onError(new Exception("Rate limit exceeded maximum retry attempts."));
-
-                                if (onCompletionCallback != null) {
-                                    onCompletionCallback.run();
-                                }
-                            }
+                            CompletableFuture.delayedExecutor(backoffSeconds, java.util.concurrent.TimeUnit.SECONDS)
+                                .execute(() -> {
+                                    if (isConversationActive && !isCancelled) {
+                                        userHandler.onUpdate("🔄 Resuming...\n");
+                                        continueConversation();
+                                    }
+                                });
                         } else {
                             // Non-rate-limit errors stop the conversation
                             isConversationActive = false;
@@ -636,32 +615,21 @@ public class ConversationalToolHandler {
             error.getMessage().contains("429")) {
 
             rateLimitRetries++;
+            Msg.warn(ConversationalToolHandler.this,
+                String.format("Rate limit exceeded during streaming (attempt %d). Retrying with backoff...",
+                    rateLimitRetries));
 
-            if (rateLimitRetries <= MAX_RATE_LIMIT_RETRIES) {
-                Msg.warn(ConversationalToolHandler.this,
-                    String.format("Rate limit exceeded during streaming (attempt %d/%d).",
-                        rateLimitRetries, MAX_RATE_LIMIT_RETRIES));
+            int backoffSeconds = Math.min(10 * rateLimitRetries, MAX_RATE_LIMIT_BACKOFF_SECONDS);
+            userHandler.onUpdate(String.format("⏳ Rate limit hit. Pausing for %d seconds...\n",
+                backoffSeconds));
 
-                int backoffSeconds = 30 * rateLimitRetries;
-                userHandler.onUpdate(String.format("⏳ Rate limit exceeded. Pausing for %d seconds...\n",
-                    backoffSeconds));
-
-                CompletableFuture.delayedExecutor(backoffSeconds, java.util.concurrent.TimeUnit.SECONDS)
-                    .execute(() -> {
-                        if (isConversationActive && !isCancelled) {
-                            userHandler.onUpdate("🔄 Resuming...\n");
-                            continueConversation();
-                        }
-                    });
-            } else {
-                isConversationActive = false;
-                userHandler.onUpdate("❌ Too many rate limit errors. Please try again later.\n");
-                userHandler.onError(new Exception("Rate limit exceeded maximum retry attempts."));
-
-                if (onCompletionCallback != null) {
-                    onCompletionCallback.run();
-                }
-            }
+            CompletableFuture.delayedExecutor(backoffSeconds, java.util.concurrent.TimeUnit.SECONDS)
+                .execute(() -> {
+                    if (isConversationActive && !isCancelled) {
+                        userHandler.onUpdate("🔄 Resuming...\n");
+                        continueConversation();
+                    }
+                });
         } else {
             isConversationActive = false;
             userHandler.onError(error);

@@ -280,8 +280,8 @@ public class ReActOrchestrator {
                     }
                 });
 
-                // Wait for planning to complete
-                String todoList = planningFuture.get(30, java.util.concurrent.TimeUnit.SECONDS);
+                // Wait for planning to complete (generous timeout to accommodate rate limiting and token refresh)
+                String todoList = planningFuture.get(180, java.util.concurrent.TimeUnit.SECONDS);
                 todoManager.initializeFromLLMResponse(todoList);
                 Msg.info(this, "Investigation plan created with " + todoManager.getAllTodos().size() + " steps");
 
