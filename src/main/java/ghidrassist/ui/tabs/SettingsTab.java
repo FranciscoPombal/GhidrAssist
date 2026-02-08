@@ -25,6 +25,7 @@ import ghidrassist.services.symgraph.SymGraphService;
 import ghidrassist.apiprovider.oauth.OAuthCallbackServer;
 import ghidrassist.apiprovider.oauth.OAuthTokenManager;
 import ghidrassist.apiprovider.oauth.OpenAIOAuthTokenManager;
+import ghidrassist.apiprovider.oauth.GeminiOAuthTokenManager;
 
 /**
  * Unified Settings tab matching BinAssist's layout.
@@ -38,7 +39,7 @@ import ghidrassist.apiprovider.oauth.OpenAIOAuthTokenManager;
  */
 public class SettingsTab extends JPanel {
     private static final long serialVersionUID = 1L;
-    private static final String VERSION = "1.16.0";
+    private static final String VERSION = "1.17.0";
     private static final String[] REASONING_EFFORT_OPTIONS = {"None", "Low", "Medium", "High"};
 
     private final TabController controller;
@@ -796,7 +797,8 @@ public class SettingsTab extends JPanel {
             if (selectedType == null) return;
             boolean isAnthropicOAuth = selectedType == APIProvider.ProviderType.ANTHROPIC_OAUTH;
             boolean isOpenAIOAuth = selectedType == APIProvider.ProviderType.OPENAI_OAUTH;
-            boolean isOAuth = isAnthropicOAuth || isOpenAIOAuth;
+            boolean isGeminiOAuth = selectedType == APIProvider.ProviderType.GEMINI_OAUTH;
+            boolean isOAuth = isAnthropicOAuth || isOpenAIOAuth || isGeminiOAuth;
             boolean isAnthropicClaudeCli = selectedType == APIProvider.ProviderType.ANTHROPIC_CLAUDE_CLI;
             
             // Hide URL for OAuth (uses fixed endpoints)
@@ -812,6 +814,8 @@ public class SettingsTab extends JPanel {
                 oauthNoteLabel.setText("<html><i>Click 'Authenticate' to sign in with Claude Pro/Max subscription.</i></html>");
             } else if (isOpenAIOAuth) {
                 oauthNoteLabel.setText("<html><i>Click 'Authenticate' to sign in with ChatGPT Pro/Plus subscription.</i></html>");
+            } else if (isGeminiOAuth) {
+                oauthNoteLabel.setText("<html><i>Click 'Authenticate' to sign in with Google Gemini CLI.</i></html>");
             }
             
             // Show Claude Code note only for Claude Code
@@ -836,6 +840,9 @@ public class SettingsTab extends JPanel {
                 case ANTHROPIC_PLATFORM_API:
                     defaultUrl = "https://api.anthropic.com/";
                     defaultModel = "claude-sonnet-4-5";
+                    break;
+                case GEMINI_OAUTH:
+                    defaultModel = "gemini-2.5-flash";
                     break;
                 case GEMINI_PLATFORM_API:
                     defaultUrl = "https://generativelanguage.googleapis.com/v1beta/openai/";
@@ -887,9 +894,12 @@ public class SettingsTab extends JPanel {
         authenticateButton.addActionListener(e -> {
             APIProvider.ProviderType selectedType = (APIProvider.ProviderType) typeComboBox.getSelectedItem();
             boolean isOpenAIOAuth = selectedType == APIProvider.ProviderType.OPENAI_OAUTH;
-            
+            boolean isGeminiOAuth = selectedType == APIProvider.ProviderType.GEMINI_OAUTH;
+
             if (isOpenAIOAuth) {
                 authenticateOpenAIOAuth(panel, keyField);
+            } else if (isGeminiOAuth) {
+                authenticateGeminiOAuth(panel, keyField);
             } else {
                 authenticateAnthropicOAuth(panel, keyField);
             }
@@ -916,8 +926,9 @@ public class SettingsTab extends JPanel {
             }
             
             // For OAuth, key must contain valid JSON token
-            if (selectedType == APIProvider.ProviderType.ANTHROPIC_OAUTH || 
-                selectedType == APIProvider.ProviderType.OPENAI_OAUTH) {
+            if (selectedType == APIProvider.ProviderType.ANTHROPIC_OAUTH ||
+                selectedType == APIProvider.ProviderType.OPENAI_OAUTH ||
+                selectedType == APIProvider.ProviderType.GEMINI_OAUTH) {
                 if (key.isEmpty() || !key.trim().startsWith("{")) {
                     JOptionPane.showMessageDialog(this, 
                         "OAuth token is required. Please click 'Authenticate' to sign in.",
@@ -935,6 +946,8 @@ public class SettingsTab extends JPanel {
                 provider.setUrl("https://api.anthropic.com/");
             } else if (selectedType == APIProvider.ProviderType.OPENAI_OAUTH) {
                 provider.setUrl("https://chatgpt.com/");
+            } else if (selectedType == APIProvider.ProviderType.GEMINI_OAUTH) {
+                provider.setUrl("https://cloudcode-pa.googleapis.com/");
             } else {
                 provider.setUrl(url.endsWith("/") ? url : url + "/");
             }
@@ -1538,6 +1551,198 @@ public class SettingsTab extends JPanel {
             }
         };
         
+        exchangeWorker.execute();
+    }
+
+    // ==== Gemini OAuth Authentication Methods ====
+
+    /**
+     * Authenticates with Google Gemini OAuth using automatic callback capture.
+     * Falls back to manual code entry if automatic capture fails.
+     */
+    private void authenticateGeminiOAuth(JPanel parentPanel, JTextField keyField) {
+        GeminiOAuthTokenManager tokenManager = new GeminiOAuthTokenManager();
+
+        // Create progress dialog with cancel option
+        JDialog progressDialog = new JDialog(SwingUtilities.getWindowAncestor(parentPanel),
+            "Gemini OAuth Authentication", Dialog.ModalityType.APPLICATION_MODAL);
+        JPanel progressPanel = new JPanel(new BorderLayout(10, 10));
+        progressPanel.setBorder(BorderFactory.createEmptyBorder(20, 20, 20, 20));
+
+        JLabel statusLabel = new JLabel("Opening browser for authentication...");
+        JProgressBar progressBar = new JProgressBar();
+        progressBar.setIndeterminate(true);
+
+        JButton cancelButton = new JButton("Cancel");
+        JButton manualButton = new JButton("Use Manual Entry");
+
+        JPanel buttonPanel = new JPanel(new FlowLayout(FlowLayout.CENTER, 10, 0));
+        buttonPanel.add(manualButton);
+        buttonPanel.add(cancelButton);
+
+        progressPanel.add(statusLabel, BorderLayout.NORTH);
+        progressPanel.add(progressBar, BorderLayout.CENTER);
+        progressPanel.add(buttonPanel, BorderLayout.SOUTH);
+
+        progressDialog.setContentPane(progressPanel);
+        progressDialog.setSize(400, 150);
+        progressDialog.setLocationRelativeTo(parentPanel);
+
+        // Track authentication state
+        final boolean[] authCompleted = {false};
+        final boolean[] cancelled = {false};
+
+        // Worker for automatic callback authentication
+        SwingWorker<String, Void> authWorker = new SwingWorker<String, Void>() {
+            private String errorMessage = null;
+            private OAuthCallbackServer callbackServer = null;
+
+            @Override
+            protected String doInBackground() {
+                try {
+                    callbackServer = tokenManager.startAuthorizationFlowWithCallback();
+                    publish(); // Update status
+
+                    // Wait for callback with 5 minute timeout
+                    tokenManager.completeAuthorizationWithCallback(callbackServer, 5);
+                    return tokenManager.toJson();
+                } catch (Exception ex) {
+                    if (!cancelled[0]) {
+                        errorMessage = ex.getMessage();
+                    }
+                    return null;
+                }
+            }
+
+            @Override
+            protected void process(java.util.List<Void> chunks) {
+                statusLabel.setText("Waiting for authentication in browser...");
+            }
+
+            @Override
+            protected void done() {
+                if (cancelled[0]) return;
+
+                try {
+                    String credentialsJson = get();
+                    if (credentialsJson != null && !credentialsJson.isEmpty()) {
+                        authCompleted[0] = true;
+                        progressDialog.dispose();
+                        keyField.setText(credentialsJson);
+                        JOptionPane.showMessageDialog(parentPanel,
+                            "Successfully authenticated with Google Gemini CLI!\n\nThe OAuth token has been stored.",
+                            "Authentication Successful",
+                            JOptionPane.INFORMATION_MESSAGE);
+                    } else if (errorMessage != null && !cancelled[0]) {
+                        progressDialog.dispose();
+                        // Fall back to manual entry on error
+                        authenticateGeminiOAuthManual(parentPanel, keyField);
+                    }
+                } catch (Exception ex) {
+                    if (!cancelled[0]) {
+                        progressDialog.dispose();
+                        authenticateGeminiOAuthManual(parentPanel, keyField);
+                    }
+                }
+            }
+
+            public void cancel() {
+                cancelled[0] = true;
+                tokenManager.cancelAuthentication();
+            }
+        };
+
+        // Cancel button action
+        cancelButton.addActionListener(e -> {
+            cancelled[0] = true;
+            tokenManager.cancelAuthentication();
+            authWorker.cancel(true);
+            progressDialog.dispose();
+        });
+
+        // Manual entry button action
+        manualButton.addActionListener(e -> {
+            cancelled[0] = true;
+            tokenManager.cancelAuthentication();
+            authWorker.cancel(true);
+            progressDialog.dispose();
+            authenticateGeminiOAuthManual(parentPanel, keyField);
+        });
+
+        // Start the worker
+        authWorker.execute();
+
+        // Show progress dialog (blocks until closed)
+        progressDialog.setVisible(true);
+    }
+
+    /**
+     * Manual OAuth code entry for Google Gemini (fallback).
+     * Uses headless mode with PKCE S256 and codeassist.google.com/authcode redirect.
+     */
+    private void authenticateGeminiOAuthManual(JPanel parentPanel, JTextField keyField) {
+        GeminiOAuthTokenManager tokenManager = new GeminiOAuthTokenManager();
+        tokenManager.startAuthorizationFlow();
+
+        String code = (String) JOptionPane.showInputDialog(
+            parentPanel,
+            "<html>A browser window has been opened for Google Gemini authentication.<br><br>" +
+            "<b>Instructions:</b><br>" +
+            "1. Sign in to your Google account in the browser<br>" +
+            "2. Authorize GhidrAssist to access your account<br>" +
+            "3. Copy the authorization code shown on the page<br>" +
+            "4. Paste it below:<br><br>" +
+            "<b>Authorization Code:</b></html>",
+            "Gemini OAuth Authentication",
+            JOptionPane.PLAIN_MESSAGE,
+            null,
+            null,
+            ""
+        );
+
+        if (code == null || code.trim().isEmpty()) {
+            return;
+        }
+
+        SwingWorker<String, Void> exchangeWorker = new SwingWorker<String, Void>() {
+            private String errorMessage = null;
+
+            @Override
+            protected String doInBackground() {
+                try {
+                    tokenManager.authenticateWithCode(code.trim());
+                    return tokenManager.toJson();
+                } catch (Exception ex) {
+                    errorMessage = ex.getMessage();
+                    return null;
+                }
+            }
+
+            @Override
+            protected void done() {
+                try {
+                    String credentialsJson = get();
+                    if (credentialsJson != null && !credentialsJson.isEmpty()) {
+                        keyField.setText(credentialsJson);
+                        JOptionPane.showMessageDialog(parentPanel,
+                            "Successfully authenticated with Google Gemini CLI!\n\nThe OAuth token has been stored.",
+                            "Authentication Successful",
+                            JOptionPane.INFORMATION_MESSAGE);
+                    } else if (errorMessage != null) {
+                        JOptionPane.showMessageDialog(parentPanel,
+                            "Authentication failed: " + errorMessage,
+                            "Authentication Error",
+                            JOptionPane.ERROR_MESSAGE);
+                    }
+                } catch (Exception ex) {
+                    JOptionPane.showMessageDialog(parentPanel,
+                        "Authentication error: " + ex.getMessage(),
+                        "Authentication Error",
+                        JOptionPane.ERROR_MESSAGE);
+                }
+            }
+        };
+
         exchangeWorker.execute();
     }
 

@@ -26,6 +26,7 @@ public abstract class APIProvider implements ChatProvider {
         ANTHROPIC_OAUTH,
         ANTHROPIC_PLATFORM_API,
         AZURE_OPENAI,
+        GEMINI_OAUTH,
         GEMINI_PLATFORM_API,
         LITELLM,
         LMSTUDIO,
