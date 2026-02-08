@@ -787,9 +787,13 @@ public class SettingsTab extends JPanel {
         gbc.gridx = 1; gbc.gridy = row; gbc.gridwidth = 2;
         panel.add(disableTlsCheckbox, gbc);
         
+        // Track whether the type change is user-initiated (vs initial load)
+        boolean[] isUserChange = {false};
+
         // Function to update UI based on provider type
         Runnable updateUIForProviderType = () -> {
             APIProvider.ProviderType selectedType = (APIProvider.ProviderType) typeComboBox.getSelectedItem();
+            if (selectedType == null) return;
             boolean isAnthropicOAuth = selectedType == APIProvider.ProviderType.ANTHROPIC_OAUTH;
             boolean isOpenAIOAuth = selectedType == APIProvider.ProviderType.OPENAI_OAUTH;
             boolean isOAuth = isAnthropicOAuth || isOpenAIOAuth;
@@ -822,16 +826,59 @@ public class SettingsTab extends JPanel {
                 keyField.setToolTipText(null);
             }
             
-            // Set default model for OAuth if empty
-            if (isAnthropicOAuth && modelField.getText().trim().isEmpty()) {
-                modelField.setText("claude-sonnet-4-20250514");
-            } else if (isOpenAIOAuth && modelField.getText().trim().isEmpty()) {
-                modelField.setText("gpt-5.1-codex");
+            // Set provider-specific defaults for empty fields
+            String defaultUrl = null;
+            String defaultModel = null;
+            switch (selectedType) {
+                case ANTHROPIC_OAUTH:
+                    defaultModel = "claude-sonnet-4-20250514";
+                    break;
+                case ANTHROPIC_PLATFORM_API:
+                    defaultUrl = "https://api.anthropic.com/";
+                    defaultModel = "claude-sonnet-4-5";
+                    break;
+                case GEMINI_PLATFORM_API:
+                    defaultUrl = "https://generativelanguage.googleapis.com/v1beta/openai/";
+                    defaultModel = "gemini-2.5-flash";
+                    break;
+                case LMSTUDIO:
+                    defaultUrl = "http://127.0.0.1:1234";
+                    defaultModel = "openai/gpt-oss-20b";
+                    break;
+                case OLLAMA:
+                    defaultUrl = "http://127.0.0.1:11434";
+                    defaultModel = "gpt-oss:20b";
+                    break;
+                case OPENAI_OAUTH:
+                    defaultModel = "gpt-5.1-codex";
+                    break;
+                case OPENAI_PLATFORM_API:
+                    defaultUrl = "https://api.openai.com/v1/";
+                    defaultModel = "gpt-5.2-codex";
+                    break;
+                case XAI_PLATFORM_API:
+                    defaultUrl = "https://api.x.ai/v1";
+                    defaultModel = "grok-3-mini";
+                    break;
+                default:
+                    break;
+            }
+            if (isUserChange[0] || urlField.getText().trim().isEmpty()) {
+                urlField.setText(defaultUrl != null ? defaultUrl : "");
+            }
+            if (isUserChange[0] || modelField.getText().trim().isEmpty()) {
+                modelField.setText(defaultModel != null ? defaultModel : "");
+            }
+            if (isUserChange[0] || maxTokensField.getText().trim().isEmpty()) {
+                maxTokensField.setText("16384");
             }
         };
         
         // Add listener to update UI when type changes
-        typeComboBox.addActionListener(e -> updateUIForProviderType.run());
+        typeComboBox.addActionListener(e -> {
+            isUserChange[0] = true;
+            updateUIForProviderType.run();
+        });
         
         // Initial UI update
         updateUIForProviderType.run();

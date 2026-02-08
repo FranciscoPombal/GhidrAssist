@@ -128,12 +128,14 @@ public class ProviderRegistry {
         registerFactory(new AnthropicOAuthProviderFactory());
         registerFactory(new AnthropicPlatformApiProviderFactory());
         registerFactory(new AzureOpenAIProviderFactory());
+        registerFactory(new GeminiPlatformApiProviderFactory());
         registerFactory(new LiteLLMProviderFactory());
         registerFactory(new LMStudioProviderFactory());
         registerFactory(new OllamaProviderFactory());
         registerFactory(new OpenAIOAuthProviderFactory());
         registerFactory(new OpenAIPlatformApiProviderFactory());
         registerFactory(new OpenWebUiProviderFactory());
+        registerFactory(new XaiPlatformApiProviderFactory());
     }
     
     /**

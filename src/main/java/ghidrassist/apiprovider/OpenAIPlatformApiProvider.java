@@ -928,40 +928,49 @@ public class OpenAIPlatformApiProvider extends APIProvider implements FunctionCa
         try {
             JsonObject errorObj = gson.fromJson(responseBody, JsonObject.class);
             if (errorObj.has("error")) {
-                JsonObject error = errorObj.getAsJsonObject("error");
-                if (error.has("type")) {
-                    JsonElement typeElement = error.get("type");
-                    if (typeElement != null && !typeElement.isJsonNull()) {
-                        return typeElement.getAsString();
-                    }
-                } else if (error.has("code")) {
-                    JsonElement codeElement = error.get("code");
-                    if (codeElement != null && !codeElement.isJsonNull()) {
-                        return codeElement.getAsString();
+                JsonElement errorElement = errorObj.get("error");
+                if (errorElement.isJsonObject()) {
+                    JsonObject error = errorElement.getAsJsonObject();
+                    if (error.has("type")) {
+                        JsonElement typeElement = error.get("type");
+                        if (typeElement != null && !typeElement.isJsonNull()) {
+                            return typeElement.getAsString();
+                        }
+                    } else if (error.has("code")) {
+                        JsonElement codeElement = error.get("code");
+                        if (codeElement != null && !codeElement.isJsonNull()) {
+                            return codeElement.getAsString();
+                        }
                     }
                 }
             }
         } catch (JsonSyntaxException e) {
             // Ignore parsing errors
         }
-        
+
         return null;
     }
-    
+
     @Override
     protected String extractErrorMessage(String responseBody, int statusCode) {
         if (responseBody == null || responseBody.isEmpty()) {
             return null;
         }
-        
+
         try {
             JsonObject errorObj = gson.fromJson(responseBody, JsonObject.class);
             if (errorObj.has("error")) {
-                JsonObject error = errorObj.getAsJsonObject("error");
-                if (error.has("message")) {
-                    JsonElement messageElement = error.get("message");
-                    if (messageElement != null && !messageElement.isJsonNull()) {
-                        return messageElement.getAsString();
+                JsonElement errorElement = errorObj.get("error");
+                if (errorElement.isJsonPrimitive()) {
+                    return errorElement.getAsString();
+                }
+                if (errorElement.isJsonObject()) {
+                    JsonObject error = errorElement.getAsJsonObject();
+                    if (error.has("message")) {
+                        JsonElement messageElement = error.get("message");
+                        if (messageElement != null && !messageElement.isJsonNull()) {
+                            return messageElement.getAsString();
+                        }
                     }
                 }
             }
