@@ -66,9 +66,11 @@ public class SymGraphService {
                 .readTimeout(Duration.ofSeconds(TIMEOUT_SECONDS))
                 .writeTimeout(Duration.ofSeconds(TIMEOUT_SECONDS));
 
-        // For localhost development, allow insecure connections
+        // Allow insecure connections for localhost and private/internal networks
         String apiUrl = getApiUrl();
-        if (apiUrl.contains("localhost") || apiUrl.contains("127.0.0.1")) {
+        if (apiUrl.contains("localhost") || apiUrl.contains("127.0.0.1")
+                || apiUrl.matches(".*://10\\..*") || apiUrl.matches(".*://172\\.(1[6-9]|2[0-9]|3[01])\\..*")
+                || apiUrl.matches(".*://192\\.168\\..*")) {
             try {
                 // Create a trust manager that does not validate certificate chains
                 final javax.net.ssl.TrustManager[] trustAllCerts = new javax.net.ssl.TrustManager[]{
@@ -90,7 +92,7 @@ public class SymGraphService {
                 builder.sslSocketFactory(sslSocketFactory, (javax.net.ssl.X509TrustManager) trustAllCerts[0]);
                 builder.hostnameVerifier((hostname, session) -> true);
 
-                Msg.debug(this, TAG + ": Using insecure SSL for localhost development");
+                Msg.debug(this, TAG + ": Using insecure SSL for internal network: " + apiUrl);
             } catch (Exception e) {
                 Msg.warn(this, TAG + ": Failed to configure insecure SSL: " + e.getMessage());
             }
@@ -778,13 +780,23 @@ public class SymGraphService {
         List<ConflictEntry> conflicts = new ArrayList<>();
         int skippedDefault = 0;
         int skippedConfidence = 0;
+        int skippedDuplicate = 0;
 
+        // Deduplicate by address: keep the best symbol per address.
+        // Prefer named symbols (function/variable) over comments,
+        // and higher confidence over lower.
+        Map<Long, Symbol> bestByAddress = new java.util.LinkedHashMap<>();
         for (Symbol remoteSym : remoteSymbols) {
-            // Comments don't require names - they store text in content, not name
-            String symbolType = remoteSym.getSymbolType();
-            boolean isComment = "comment".equals(symbolType);
+            String displayName = remoteSym.getDisplayName();
+            boolean isComment = "comment".equals(remoteSym.getSymbolType());
 
-            // Skip remote symbols with default/auto-generated names (but not comments)
+            // Skip symbols with no useful display name (null name AND null content)
+            if (displayName == null || displayName.isEmpty()) {
+                skippedDefault++;
+                continue;
+            }
+
+            // Skip non-comment symbols with default/auto-generated names
             if (!isComment && SymGraphUtils.isDefaultName(remoteSym.getName())) {
                 skippedDefault++;
                 continue;
@@ -797,13 +809,35 @@ public class SymGraphService {
             }
 
             long addr = remoteSym.getAddress();
+            Symbol existing = bestByAddress.get(addr);
+            if (existing == null) {
+                bestByAddress.put(addr, remoteSym);
+            } else {
+                // Prefer non-comment over comment, then higher confidence
+                boolean existingIsComment = "comment".equals(existing.getSymbolType());
+                if (existingIsComment && !isComment) {
+                    bestByAddress.put(addr, remoteSym);
+                    skippedDuplicate++;
+                } else if (!existingIsComment && isComment) {
+                    skippedDuplicate++;
+                } else if (remoteSym.getConfidence() > existing.getConfidence()) {
+                    bestByAddress.put(addr, remoteSym);
+                    skippedDuplicate++;
+                } else {
+                    skippedDuplicate++;
+                }
+            }
+        }
+
+        for (Symbol remoteSym : bestByAddress.values()) {
+            long addr = remoteSym.getAddress();
             String localName = localSymbols.get(addr);
             boolean localIsDefault = SymGraphUtils.isDefaultName(localName);
 
             if (localName == null || localIsDefault) {
                 // Remote only OR local has default name - NEW (safe to apply)
                 conflicts.add(ConflictEntry.createNew(addr, remoteSym));
-            } else if (localName.equals(remoteSym.getName())) {
+            } else if (localName.equals(remoteSym.getDisplayName())) {
                 // Same value - SAME
                 conflicts.add(ConflictEntry.createSame(addr, localName, remoteSym));
             } else {
@@ -812,9 +846,9 @@ public class SymGraphService {
             }
         }
 
-        if (skippedDefault > 0 || skippedConfidence > 0) {
-            Msg.info(this, String.format("Filtered out %d default names, %d low confidence symbols",
-                    skippedDefault, skippedConfidence));
+        if (skippedDefault > 0 || skippedConfidence > 0 || skippedDuplicate > 0) {
+            Msg.info(this, String.format("Filtered out %d default names, %d low confidence, %d duplicates",
+                    skippedDefault, skippedConfidence, skippedDuplicate));
         }
 
         return conflicts;

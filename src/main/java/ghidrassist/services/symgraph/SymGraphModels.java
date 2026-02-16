@@ -120,6 +120,21 @@ public class SymGraphModels {
         public void setSource(String source) { this.source = source; }
         public String getContent() { return content; }
         public void setContent(String content) { this.content = content; }
+
+        /**
+         * Get the display name for this symbol.
+         * For comments (which have no name), returns the content field.
+         * For other symbols, returns the name.
+         */
+        public String getDisplayName() {
+            if (name != null && !name.isEmpty()) {
+                return name;
+            }
+            if (content != null && !content.isEmpty()) {
+                return content;
+            }
+            return null;
+        }
         public Map<String, Object> getMetadata() { return metadata; }
         public void setMetadata(Map<String, Object> metadata) { this.metadata = metadata; }
     }
@@ -224,12 +239,12 @@ public class SymGraphModels {
         }
 
         public static ConflictEntry createNew(long address, Symbol remoteSymbol) {
-            return new ConflictEntry(address, null, remoteSymbol.getName(),
+            return new ConflictEntry(address, null, remoteSymbol.getDisplayName(),
                     ConflictAction.NEW, true, remoteSymbol);
         }
 
         public static ConflictEntry createConflict(long address, String localName, Symbol remoteSymbol) {
-            return new ConflictEntry(address, localName, remoteSymbol.getName(),
+            return new ConflictEntry(address, localName, remoteSymbol.getDisplayName(),
                     ConflictAction.CONFLICT, false, remoteSymbol);
         }
 

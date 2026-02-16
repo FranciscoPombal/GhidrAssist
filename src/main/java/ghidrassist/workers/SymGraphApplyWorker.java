@@ -7,6 +7,7 @@ import ghidra.program.model.data.DataTypeManager;
 import ghidra.program.model.data.EnumDataType;
 import ghidra.program.model.data.StructureDataType;
 import ghidra.program.model.listing.CodeUnit;
+import ghidra.program.model.listing.CommentType;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.Listing;
 import ghidra.program.model.listing.Parameter;
@@ -324,7 +325,7 @@ public class SymGraphApplyWorker extends AnalysisWorker<SymGraphApplyWorker.Resu
                 // Fall back to plate comment if no function at address
                 CodeUnit codeUnit = listing.getCodeUnitAt(address);
                 if (codeUnit != null) {
-                    codeUnit.setComment(CodeUnit.PLATE_COMMENT, content);
+                    codeUnit.setComment(CommentType.PLATE, content);
                     return true;
                 }
                 return false;
@@ -337,23 +338,23 @@ public class SymGraphApplyWorker extends AnalysisWorker<SymGraphApplyWorker.Resu
             }
 
             if (codeUnit != null) {
-                int ghidraCommentType;
+                CommentType ghidraCommentType;
                 switch (commentType) {
                     case "pre":
-                        ghidraCommentType = CodeUnit.PRE_COMMENT;
+                        ghidraCommentType = CommentType.PRE;
                         break;
                     case "post":
-                        ghidraCommentType = CodeUnit.POST_COMMENT;
+                        ghidraCommentType = CommentType.POST;
                         break;
                     case "plate":
-                        ghidraCommentType = CodeUnit.PLATE_COMMENT;
+                        ghidraCommentType = CommentType.PLATE;
                         break;
                     case "repeatable":
-                        ghidraCommentType = CodeUnit.REPEATABLE_COMMENT;
+                        ghidraCommentType = CommentType.REPEATABLE;
                         break;
                     case "eol":
                     default:
-                        ghidraCommentType = CodeUnit.EOL_COMMENT;
+                        ghidraCommentType = CommentType.EOL;
                         break;
                 }
                 codeUnit.setComment(ghidraCommentType, content);

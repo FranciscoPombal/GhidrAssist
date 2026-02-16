@@ -131,21 +131,23 @@ public class MCPServerConfig {
      */
     public String getHost() {
         try {
-            java.net.URL urlObj = new java.net.URL(getBaseUrl());
-            return urlObj.getHost();
+            java.net.URI uri = java.net.URI.create(getBaseUrl());
+            String host = uri.getHost();
+            return host != null ? host : "localhost";
         } catch (Exception e) {
             return "localhost";
         }
     }
-    
+
     /**
      * Get the port from the URL
      */
     public int getPort() {
         try {
-            java.net.URL urlObj = new java.net.URL(getBaseUrl());
-            int port = urlObj.getPort();
-            return port != -1 ? port : (urlObj.getProtocol().equals("https") ? 443 : 80);
+            java.net.URI uri = java.net.URI.create(getBaseUrl());
+            int port = uri.getPort();
+            if (port != -1) return port;
+            return "https".equals(uri.getScheme()) ? 443 : 80;
         } catch (Exception e) {
             return 8081; // Default MCP port
         }
