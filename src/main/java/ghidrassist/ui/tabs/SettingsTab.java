@@ -432,7 +432,8 @@ public class SettingsTab extends JPanel {
     private void setupListeners() {
         // Active provider change
         activeProviderComboBox.addActionListener(e -> {
-            selectedProviderName = (String) activeProviderComboBox.getSelectedItem();
+            String item = (String) activeProviderComboBox.getSelectedItem();
+            selectedProviderName = (item != null) ? item : "";
             Preferences.setProperty("GhidrAssist.SelectedAPIProvider", selectedProviderName);
             Preferences.store();
         });
